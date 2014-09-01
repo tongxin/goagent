@@ -144,6 +144,7 @@ class CertUtil(object):
     ca_vendor = 'GoAgent'
     ca_keyfile = 'CA.crt'
     ca_certdir = 'certs'
+    ca_footprint = ''
     ca_lock = threading.Lock()
 
     @staticmethod
@@ -211,7 +212,7 @@ class CertUtil(object):
         cert = OpenSSL.crypto.X509()
         cert.set_version(2)
         try:
-            cert.set_serial_number(int(hashlib.md5(commonname.encode('utf-8')).hexdigest(), 16))
+            cert.set_serial_number(int(hashlib.md5((commonname+CertUtil.ca_footprint).encode('utf-8')).hexdigest(), 16))
         except OpenSSL.SSL.Error:
             cert.set_serial_number(int(time.time()*1000))
         cert.gmtime_adj_notBefore(0)
@@ -250,7 +251,7 @@ class CertUtil(object):
     @staticmethod
     def import_ca(certfile):
         commonname = os.path.splitext(os.path.basename(certfile))[0]
-        sha1digest = 'AB:70:2C:DF:18:EB:E8:B4:38:C5:28:69:CD:4A:5D:EF:48:B4:0E:33'
+        sha1digest = CertUtil.ca_footprint
         if OpenSSL:
             try:
                 with open(certfile, 'rb') as fp:
@@ -307,7 +308,7 @@ class CertUtil(object):
         certdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), CertUtil.ca_certdir)
         if not os.path.exists(capath):
             if not OpenSSL:
-                logging.critical('CA.key is not exist and OpenSSL is disabled, ABORT!')
+                logging.critical('%s is not exist and OpenSSL is disabled, ABORT!', CertUtil.ca_keyfile)
                 sys.exit(-1)
             if os.path.exists(certdir):
                 if os.path.isdir(certdir):
@@ -316,13 +317,16 @@ class CertUtil(object):
                     os.remove(certdir)
                     os.mkdir(certdir)
             CertUtil.dump_ca()
-        if glob.glob('%s/*.key' % CertUtil.ca_certdir):
-            for filename in glob.glob('%s/*.key' % CertUtil.ca_certdir):
-                try:
-                    os.remove(filename)
-                    os.remove(os.path.splitext(filename)[0]+'.crt')
-                except EnvironmentError:
-                    pass
+        with open(capath, 'rb') as fp:
+            CertUtil.ca_footprint = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, fp.read()).digest('sha1').upper()
+        children_certs = glob.glob(certdir+'/*.crt')+glob.glob(certdir+'/.*.crt')
+        if children_certs and OpenSSL:
+            filename = random.choice(children_certs)
+            commonname = os.path.splitext(os.path.basename(filename))[0]
+            with open(filename, 'rb') as fp:
+                serial_number = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, fp.read()).get_serial_number()
+            if serial_number != int(hashlib.md5((commonname+CertUtil.ca_footprint).encode('utf-8')).hexdigest(), 16):
+                any(os.remove(x) for x in children_certs)
         #Check CA imported
         if CertUtil.import_ca(capath) != 0:
             logging.warning('install root certificate failed, Please run as administrator/root/sudo')
