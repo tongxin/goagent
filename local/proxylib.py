@@ -1479,7 +1479,15 @@ class SimpleProxyHandler(BaseHTTPRequestHandler):
 
     def do_METHOD(self):
         self.parse_header()
-        self.body = self.rfile.read(int(self.headers['Content-Length'])) if 'Content-Length' in self.headers else ''
+        if 'Content-Length' in self.headers:
+            if int(self.headers['Content-Length']) < 1024*1024:
+                self.body = self.rfile.read(int(self.headers['Content-Length']))
+            else:
+                self.body = self.rfile
+        elif 'Transfer-Encoding' not in self.headers:
+            self.body = ''
+        else:
+            self.body = self.rfile
         for handler_filter in self.handler_filters:
             action = handler_filter.filter(self)
             if not action:
@@ -1932,7 +1940,8 @@ class MultipleConnectionMixin(object):
                 data = body.read(bufsize)
                 if not data:
                     break
-                sock.sendall(data)
+                sock.send(data)
+                time.sleep(0.01)
         else:
             raise TypeError('create_http_request(body) must be a string or buffer, not %r' % type(body))
         response = None
