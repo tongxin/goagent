@@ -38,6 +38,13 @@ conf = {'GENERAL': {'PARENT_PROXY': PARENT_PROXY,
 
 #--------------------------------------------------------------
 import sys
+import sysconfig
+import os
+
+sys.path = [(os.path.dirname(__file__) or '.') + '/packages.egg/noarch'] + sys.path + [(os.path.dirname(__file__) or '.') + '/packages.egg/' + sysconfig.get_platform().split('-')[0]]
+
+import gevent.monkey
+gevent.monkey.patch_all()
 
 print 'NTLM authorization Proxy Server v%s' % conf['GENERAL']['VERSION']
 print 'Copyright (C) 2001-2009 by Dmitry Rozmanov, Darryl Dixon, and others.'
@@ -54,17 +61,6 @@ if conf['NTLM_AUTH']['NTLM_TO_BASIC'] == '0':
         os.system('cls')
     print
 
-try:
-    import gevent
-    import gevent.socket
-    import gevent.server
-    import gevent.queue
-    import gevent.monkey
-    gevent.monkey.patch_all()
-except ImportError:
-    sys.stderr.write('\033[31m  Warning: Please update gevent to the latest 1.0 version!\033[0m\n')
-
-sys.path += ['packages.egg/noarch']
 import ntlmaps
 serv = ntlmaps.server.AuthProxyServer(ntlmaps.config_affairs.arrange(conf))
 serv.run()
