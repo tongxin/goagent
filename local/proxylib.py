@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding:utf-8
 
-__version__ = '1.0'
+__version__ = '1.1'
 
 import sys
 import os
@@ -147,33 +147,31 @@ class CertUtil(object):
     ca_keyfile = 'CA.crt'
     ca_thumbprint = ''
     ca_certdir = 'certs'
+    ca_digest = 'sha1' if sys.platform == 'win32' and sys.getwindowsversion() < (6,) else 'sha256'
     ca_lock = threading.Lock()
 
     @staticmethod
     def create_ca():
         key = OpenSSL.crypto.PKey()
         key.generate_key(OpenSSL.crypto.TYPE_RSA, 2048)
-        ca = OpenSSL.crypto.X509()
-        ca.set_serial_number(0)
-        ca.set_version(0)
-        subj = ca.get_subject()
+        req = OpenSSL.crypto.X509Req()
+        subj = req.get_subject()
         subj.countryName = 'CN'
         subj.stateOrProvinceName = 'Internet'
         subj.localityName = 'Cernet'
         subj.organizationName = CertUtil.ca_vendor
         subj.organizationalUnitName = '%s Root' % CertUtil.ca_vendor
         subj.commonName = '%s CA' % CertUtil.ca_vendor
+        req.set_pubkey(key)
+        req.sign(key, CertUtil.ca_digest)
+        ca = OpenSSL.crypto.X509()
+        ca.set_serial_number(0)
         ca.gmtime_adj_notBefore(0)
         ca.gmtime_adj_notAfter(24 * 60 * 60 * 3652)
-        ca.set_issuer(ca.get_subject())
-        ca.set_pubkey(key)
-        ca.add_extensions([
-            OpenSSL.crypto.X509Extension(b'basicConstraints', True, b'CA:TRUE'),
-            # OpenSSL.crypto.X509Extension(b'nsCertType', True, b'sslCA'),
-            OpenSSL.crypto.X509Extension(b'extendedKeyUsage', True, b'serverAuth,clientAuth,emailProtection,timeStamping,msCodeInd,msCodeCom,msCTLSign,msSGC,msEFS,nsSGC'),
-            OpenSSL.crypto.X509Extension(b'keyUsage', False, b'keyCertSign, cRLSign'),
-            OpenSSL.crypto.X509Extension(b'subjectKeyIdentifier', False, b'hash', subject=ca), ])
-        ca.sign(key, 'sha1')
+        ca.set_issuer(req.get_subject())
+        ca.set_subject(req.get_subject())
+        ca.set_pubkey(req.get_pubkey())
+        ca.sign(key, CertUtil.ca_digest)
         return key, ca
 
     @staticmethod
@@ -215,7 +213,7 @@ class CertUtil(object):
             sans = [commonname] + [x for x in sans if x != commonname]
         #req.add_extensions([OpenSSL.crypto.X509Extension(b'subjectAltName', True, ', '.join('DNS: %s' % x for x in sans)).encode()])
         req.set_pubkey(pkey)
-        req.sign(pkey, 'sha1')
+        req.sign(pkey, CertUtil.ca_digest)
 
         cert = OpenSSL.crypto.X509()
         cert.set_version(2)
@@ -233,7 +231,7 @@ class CertUtil(object):
         else:
             sans = [commonname] + [s for s in sans if s != commonname]
         #cert.add_extensions([OpenSSL.crypto.X509Extension(b'subjectAltName', True, ', '.join('DNS: %s' % x for x in sans))])
-        cert.sign(key, 'sha1')
+        cert.sign(key, CertUtil.ca_digest)
 
         certfile = os.path.join(CertUtil.ca_certdir, commonname + '.crt')
         with open(certfile, 'wb') as fp:
@@ -337,10 +335,13 @@ class CertUtil(object):
             if os.path.exists(certdir):
                 any(os.remove(x) for x in glob.glob(certdir+'/*.crt')+glob.glob(certdir+'/.*.crt'))
             if os.name == 'nt':
-                CertUtil.remove_ca('%s CA' % CertUtil.ca_vendor)
+                try:
+                    CertUtil.remove_ca('%s CA' % CertUtil.ca_vendor)
+                except Exception as e:
+                    logging.warning('CertUtil.remove_ca failed: %r', e)
             CertUtil.dump_ca()
         with open(capath, 'rb') as fp:
-            CertUtil.ca_thumbprint = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, fp.read()).digest('sha1')
+            CertUtil.ca_thumbprint = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, fp.read()).digest(CertUtil.ca_digest)
         #Check Certs
         certfiles = glob.glob(certdir+'/*.crt')+glob.glob(certdir+'/.*.crt')
         if certfiles:
@@ -566,6 +567,7 @@ def dnslib_resolve_over_udp(query, dnsservers, timeout, **kwargs):
     http://gfwrev.blogspot.com/2009/11/gfwdns.html
     http://zh.wikipedia.org/wiki/%E5%9F%9F%E5%90%8D%E6%9C%8D%E5%8A%A1%E5%99%A8%E7%BC%93%E5%AD%98%E6%B1%A1%E6%9F%93
     http://support.microsoft.com/kb/241352
+    https://gist.github.com/klzgrad/f124065c0616022b65e5
     """
     if not isinstance(query, (basestring, dnslib.DNSRecord)):
         raise TypeError('query argument requires string/DNSRecord')
@@ -588,8 +590,12 @@ def dnslib_resolve_over_udp(query, dnsservers, timeout, **kwargs):
             try:
                 for dnsserver in dns_v4_servers:
                     if isinstance(query, basestring):
+                        if dnsserver in ('8.8.8.8', '8.8.4.4'):
+                            query = '.'.join(x[:-1] + x[-1].upper() for x in query.split('.')).title()
                         query = dnslib.DNSRecord(q=dnslib.DNSQuestion(query))
                     query_data = query.pack()
+                    if query.q.qtype == 1 and dnsserver in ('8.8.8.8', '8.8.4.4'):
+                        query_data = query_data[:-5] + '\xc0\x04' + query_data[-4:]
                     sock_v4.sendto(query_data, parse_hostport(dnsserver, 53))
                 for dnsserver in dns_v6_servers:
                     if isinstance(query, basestring):
@@ -955,30 +961,17 @@ class StripPlugin(BaseFetchPlugin):
     """strip fetch plugin"""
 
     def __init__(self, ssl_version='SSLv23', ciphers='ALL:!aNULL:!eNULL', cache_size=128, session_cache=True):
-        self.ssl_method = getattr(OpenSSL.SSL, '%s_METHOD' % ssl_version)
+        self.ssl_method = getattr(ssl, 'PROTOCOL_%s' % ssl_version)
         self.ciphers = ciphers
-        self.ssl_context_cache = LRUCache(cache_size*2)
-        self.ssl_session_cache = session_cache
 
-    def get_ssl_context_by_hostname(self, hostname):
-        try:
-            return self.ssl_context_cache[hostname]
-        except LookupError:
-            context = OpenSSL.SSL.Context(self.ssl_method)
-            certfile = CertUtil.get_cert(hostname)
-            if certfile in self.ssl_context_cache:
-                context = self.ssl_context_cache[hostname] = self.ssl_context_cache[certfile]
-                return context
-            with open(certfile, 'rb') as fp:
-                pem = fp.read()
-                context.use_certificate(OpenSSL.crypto.load_certificate(OpenSSL.SSL.FILETYPE_PEM, pem))
-                context.use_privatekey(OpenSSL.crypto.load_privatekey(OpenSSL.SSL.FILETYPE_PEM, pem))
-            if self.ciphers:
-                context.set_cipher_list(self.ciphers)
-            self.ssl_context_cache[hostname] = self.ssl_context_cache[certfile] = context
-            if self.ssl_session_cache:
-                openssl_set_session_cache_mode(context, 'server')
-            return context
+    def do_ssl_handshake(self, handler):
+        "do_ssl_handshake with ssl"
+        certfile = CertUtil.get_cert(handler.host)
+        ssl_sock = ssl.wrap_socket(handler.connection, keyfile=certfile, certfile=certfile, server_side=True, ssl_version=self.ssl_method, ciphers=self.ciphers)
+        handler.connection = ssl_sock
+        handler.rfile = handler.connection.makefile('rb', handler.bufsize)
+        handler.wfile = handler.connection.makefile('wb', 0)
+        handler.scheme = 'https'
 
     def handle(self, handler, do_ssl_handshake=True):
         """strip connect"""
@@ -987,23 +980,11 @@ class StripPlugin(BaseFetchPlugin):
         handler.end_headers()
         if do_ssl_handshake:
             try:
-                # certfile = CertUtil.get_cert(handler.host)
-                # ssl_sock = ssl.wrap_socket(handler.connection, keyfile=certfile, certfile=certfile, server_side=True, ciphers=self.ciphers)
-                ssl_sock = SSLConnection(self.get_ssl_context_by_hostname(handler.host), handler.connection)
-                ssl_sock.set_accept_state()
-                ssl_sock.do_handshake()
-            except OpenSSL.SSL.SysCallError as e:
-                if e[0] == -1 and 'Unexpected EOF' in e[1]:
-                    return
-                raise
+                self.do_ssl_handshake(handler)
             except (socket.error, ssl.SSLError, OpenSSL.SSL.Error) as e:
-                if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET):
+                if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET) or e.args[0] == 'Unexpected EOF':
                     logging.exception('ssl.wrap_socket(connection=%r) failed: %s', handler.connection, e)
                 return
-            handler.connection = ssl_sock
-            handler.rfile = handler.connection.makefile('rb', handler.bufsize)
-            handler.wfile = handler.connection.makefile('wb', 0)
-            handler.scheme = 'https'
         try:
             handler.raw_requestline = handler.rfile.readline(65537)
             if len(handler.raw_requestline) > 65536:
@@ -1032,6 +1013,45 @@ class StripPlugin(BaseFetchPlugin):
             if e.args[0] not in (errno.ECONNABORTED, errno.ETIMEDOUT, errno.EPIPE):
                 raise
 
+class StripPluginEx(StripPlugin):
+    """strip fetch plugin"""
+
+    def __init__(self, ssl_version='SSLv23', ciphers='ALL:!aNULL:!eNULL', cache_size=128, session_cache=True):
+        self.ssl_method = getattr(OpenSSL.SSL, '%s_METHOD' % ssl_version)
+        self.ciphers = ciphers
+        self.ssl_context_cache = LRUCache(cache_size*2)
+        self.ssl_session_cache = session_cache
+
+    def get_ssl_context_by_hostname(self, hostname):
+        try:
+            return self.ssl_context_cache[hostname]
+        except LookupError:
+            context = OpenSSL.SSL.Context(self.ssl_method)
+            certfile = CertUtil.get_cert(hostname)
+            if certfile in self.ssl_context_cache:
+                context = self.ssl_context_cache[hostname] = self.ssl_context_cache[certfile]
+                return context
+            with open(certfile, 'rb') as fp:
+                pem = fp.read()
+                context.use_certificate(OpenSSL.crypto.load_certificate(OpenSSL.SSL.FILETYPE_PEM, pem))
+                context.use_privatekey(OpenSSL.crypto.load_privatekey(OpenSSL.SSL.FILETYPE_PEM, pem))
+            if self.ciphers:
+                context.set_cipher_list(self.ciphers)
+            self.ssl_context_cache[hostname] = self.ssl_context_cache[certfile] = context
+            if self.ssl_session_cache:
+                openssl_set_session_cache_mode(context, 'server')
+            return context
+
+    def do_ssl_handshake(self, handler):
+        "do_ssl_handshake with OpenSSL"
+        ssl_sock = SSLConnection(self.get_ssl_context_by_hostname(handler.host), handler.connection)
+        ssl_sock.set_accept_state()
+        ssl_sock.do_handshake()
+        handler.connection = ssl_sock
+        handler.rfile = handler.connection.makefile('rb', handler.bufsize)
+        handler.wfile = handler.connection.makefile('wb', 0)
+        handler.scheme = 'https'
+
 
 class DirectFetchPlugin(BaseFetchPlugin):
     """direct fetch plugin"""
@@ -1046,6 +1066,7 @@ class DirectFetchPlugin(BaseFetchPlugin):
             return self.handle_connect(handler, kwargs)
 
     def handle_method(self, handler, kwargs):
+        rescue_bytes = int(kwargs.pop('rescue_bytes', 0))
         method = handler.command
         if handler.path.lower().startswith(('http://', 'https://', 'ftp://')):
             url = handler.path
@@ -1055,19 +1076,33 @@ class DirectFetchPlugin(BaseFetchPlugin):
         body = handler.body
         response = None
         try:
+            if rescue_bytes:
+                headers['Range'] = 'bytes=%d-' % rescue_bytes
             response = handler.create_http_request(method, url, headers, body, timeout=self.connect_timeout, read_timeout=self.read_timeout, **kwargs)
             logging.info('%s "DIRECT %s %s %s" %s %s', handler.address_string(), handler.command, url, handler.protocol_version, response.status, response.getheader('Content-Length', '-'))
             response_headers = dict((k.title(), v) for k, v in response.getheaders())
-            handler.send_response(response.status)
-            for key, value in response.getheaders():
-                handler.send_header(key, value)
-            handler.end_headers()
+            if not rescue_bytes:
+                handler.send_response(response.status)
+                for key, value in response.getheaders():
+                    handler.send_header(key, value)
+                handler.end_headers()
             if handler.command == 'HEAD' or response.status in (204, 304):
                 response.close()
                 return
             need_chunked = 'Transfer-Encoding' in response_headers
+            bufsize = 8192
+            written = rescue_bytes
             while True:
-                data = response.read(8192)
+                data = None
+                with gevent.Timeout(self.connect_timeout, False):
+                    data = response.read(bufsize)
+                if data is None:
+                    logging.warning('DIRECT response.read(%r) %r timeout', bufsize, url)
+                    if response.getheader('Accept-Ranges', '') == 'bytes' and not urlparse.urlparse(url).query:
+                        kwargs['rescue_bytes'] = written
+                        return self.handle(handler, **kwargs)
+                    handler.close_connection = True
+                    break
                 if not data:
                     if need_chunked:
                         handler.wfile.write('0\r\n\r\n')
@@ -1075,6 +1110,7 @@ class DirectFetchPlugin(BaseFetchPlugin):
                 if need_chunked:
                     handler.wfile.write('%x\r\n' % len(data))
                 handler.wfile.write(data)
+                written += len(data)
                 if need_chunked:
                     handler.wfile.write('\r\n')
                 del data
@@ -1167,15 +1203,16 @@ class DirectRegionFilter(BaseProxyHandlerFilter):
         except KeyError:
             pass
         try:
-            if hostname.startswith(('127.', '192.168.', '10.')):
-                return 'LOCAL'
             if re.match(r'^\d+\.\d+\.\d+\.\d+$', hostname) or ':' in hostname:
                 iplist = [hostname]
             elif dnsservers:
                 iplist = dnslib_record2iplist(dnslib_resolve_over_udp(hostname, dnsservers, timeout=2))
             else:
                 iplist = socket.gethostbyname_ex(hostname)[-1]
-            country_code = self.geoip.country_code_by_addr(iplist[0])
+            if iplist[0].startswith(('127.', '192.168.', '10.')):
+                country_code = 'LOCAL'
+            else:
+                country_code = self.geoip.country_code_by_addr(iplist[0])
         except StandardError as e:
             logging.warning('DirectRegionFilter cannot determine region for hostname=%r %r', hostname, e)
             country_code = ''
@@ -1398,6 +1435,8 @@ class StaticFileFilter(BaseProxyHandlerFilter):
                 try:
                     import mimetypes
                     content_type = mimetypes.types_map.get(os.path.splitext(path)[1])
+                    if os.path.splitext(path)[1].endswith(('crt', 'pem')):
+                        content_type = 'application/x-x509-ca-cert'
                 except StandardError as e:
                     logging.error('import mimetypes failed: %r', e)
                 with open(path, 'rb') as fp:
@@ -1582,7 +1621,7 @@ class MultipleConnectionMixin(object):
     ssl_connection_keepalive = False
     iplist_predefined = set([])
     max_window = 4
-    connect_timeout = 4
+    connect_timeout = 6
     max_timeout = 8
     ssl_version = ssl.PROTOCOL_SSLv23
     openssl_context = OpenSSL.SSL.Context(OpenSSL.SSL.SSLv23_METHOD)
@@ -1696,7 +1735,7 @@ class MultipleConnectionMixin(object):
         try:
             while cache_key:
                 ctime, sock = self.tcp_connection_cache[cache_key].get_nowait()
-                if time.time() - ctime < 8:
+                if time.time() - ctime < self.connect_timeout:
                     return sock
                 else:
                     sock.close()
@@ -1834,8 +1873,8 @@ class MultipleConnectionMixin(object):
             NetworkError = (socket.error, OpenSSL.SSL.Error, OSError)
             if gevent and (ipaddr[0] not in self.iplist_predefined):
                 NetworkError += (gevent.Timeout,)
-                timer = gevent.Timeout(timeout)
-                timer.start()
+                #timer = gevent.Timeout(timeout)
+                #timer.start()
             try:
                 # create a ipv4/ipv6 socket object
                 sock = socket.socket(socket.AF_INET if ':' not in ipaddr[0] else socket.AF_INET6)
@@ -1948,7 +1987,7 @@ class MultipleConnectionMixin(object):
         try:
             while cache_key:
                 ctime, sock = self.ssl_connection_cache[cache_key].get_nowait()
-                if time.time() - ctime < 4:
+                if time.time() - ctime < self.connect_timeout:
                     return sock
                 else:
                     sock.close()
@@ -1959,30 +1998,27 @@ class MultipleConnectionMixin(object):
         sock = None
         for i in range(kwargs.get('max_retry', 4)):
             reorg_ipaddrs()
-            window = self.max_window + i
-            if len(self.ssl_connection_good_ipaddrs) > len(self.ssl_connection_bad_ipaddrs):
-                window = max(2, window-2)
-            if len(self.ssl_connection_bad_ipaddrs)/2 >= len(self.ssl_connection_good_ipaddrs) <= 1.5 * window:
-                window += 2
-            good_ipaddrs = [x for x in addresses if x in self.ssl_connection_good_ipaddrs]
-            good_ipaddrs = sorted(good_ipaddrs, key=self.ssl_connection_time.get)[:window]
+            good_ipaddrs = sorted([x for x in addresses if x in self.ssl_connection_good_ipaddrs], key=self.ssl_connection_time.get)
+            bad_ipaddrs = sorted([x for x in addresses if x in self.ssl_connection_bad_ipaddrs], key=self.ssl_connection_bad_ipaddrs.get)
             unknown_ipaddrs = [x for x in addresses if x not in self.ssl_connection_good_ipaddrs and x not in self.ssl_connection_bad_ipaddrs]
             random.shuffle(unknown_ipaddrs)
-            unknown_ipaddrs = unknown_ipaddrs[:window]
-            bad_ipaddrs = [x for x in addresses if x in self.ssl_connection_bad_ipaddrs]
-            bad_ipaddrs = sorted(bad_ipaddrs, key=self.ssl_connection_bad_ipaddrs.get)[:window]
-            addrs = good_ipaddrs + unknown_ipaddrs + bad_ipaddrs
-            remain_window = 3 * window - len(addrs)
-            if 0 < remain_window <= len(addresses):
-                addrs += random.sample(addresses, remain_window)
+            window = self.max_window + i
+            if len(bad_ipaddrs) < 0.2 * len(good_ipaddrs) and len(good_ipaddrs) > 10:
+                addrs = good_ipaddrs[:window]
+                addrs += [random.choice(unknown_ipaddrs)] if unknown_ipaddrs else []
+            elif len(good_ipaddrs) > 2 * window or len(bad_ipaddrs) < 0.5 * len(good_ipaddrs):
+                addrs = (good_ipaddrs[:window] + unknown_ipaddrs + bad_ipaddrs)[:2*window]
+            else:
+                addrs = good_ipaddrs[:window] + unknown_ipaddrs[:window] + bad_ipaddrs[:window]
+                addrs += random.sample(addresses, min(len(addresses), 3*window-len(addrs))) if len(addrs) < 3*window else []
             logging.debug('%s good_ipaddrs=%d, unknown_ipaddrs=%r, bad_ipaddrs=%r', cache_key, len(good_ipaddrs), len(unknown_ipaddrs), len(bad_ipaddrs))
             queobj = Queue.Queue()
             for addr in addrs:
-                if sys.platform != 'darwin':
-                    thread.start_new_thread(create_connection_withopenssl, (addr, timeout, queobj))
-                else:
-                    # Workaround for CPU 100% issue under MacOSX
+                if sys.platform != 'win32':
+                    # Workaround for CPU 100% issue under MacOSX/Linux
                     thread.start_new_thread(create_connection, (addr, timeout, queobj))
+                else:
+                    thread.start_new_thread(create_connection_withopenssl, (addr, timeout, queobj))
             errors = []
             for i in range(len(addrs)):
                 sock = queobj.get()
